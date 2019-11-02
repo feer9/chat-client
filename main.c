@@ -1,11 +1,11 @@
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
 #else /* unix */
-#include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+ #include <sys/socket.h>
+ #include <netdb.h>
+ #include <netinet/in.h>
+ #include <arpa/inet.h>
 #endif
 #include <unistd.h>
 #include <signal.h>
@@ -15,10 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* some win <-> unix translations/compatibility layer */
 #ifndef _WIN32 /* unix */
-#define SOCKET int
-#define INVALID_SOCKET	-1
-#define closesocket(sockfd) close(sockfd)
+ #define SOCKET int
+ #define INVALID_SOCKET	-1
+ #define SOCKET_ERROR   -1
+ #define closesocket(sockfd) close(sockfd)
 #endif
 
 
@@ -26,7 +28,7 @@
 
 size_t getLine(char *buf, int buf_sz);
 void socket_disconnected(int signal);
-void close_program(void);
+void closing_procedure(void);
 void exit_program(int signal);
 void print_help(void);
 void print_version(void);
@@ -36,8 +38,10 @@ static pthread_t start_thread(void *(* func)(void *), void *data);
 static void console(void);
 static void *thread_listen(void *data);
 
+
 static SOCKET sockfd = INVALID_SOCKET;
 static pthread_t thread_id = 0;
+static int program_closing = 0;
 
 
 int main(int argc, char *argv[])
@@ -93,7 +97,7 @@ void set_signals(void)
 		exit(1);
 	}
 #endif
-	atexit(close_program);
+	atexit(closing_procedure);
 }
 
 int open_socket(const char *address, const char *port)
@@ -119,7 +123,7 @@ int open_socket(const char *address, const char *port)
 
 	errcode = getaddrinfo(address, port, &hints, &result);
 	if(errcode != 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerrorA(errcode));
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(errcode));
 		return errcode;
 	}
 
@@ -182,7 +186,7 @@ static void console(void)
 
 			if(strncmp(cmd, "help",  5) == 0)
 				print_help();
-			
+
 			else if(strncmp(cmd, "quit",  5) == 0)
 				break;
 
@@ -213,19 +217,28 @@ static void *thread_listen(void *data)
 	while(1)
 	{
 		nbytes = recv(sockfd, buf, buffsize, 0);
-		if(nbytes == -1) {
-#ifdef _WIN32
-			int error = WSAGetLastError();
-		//	if(!(error == WSAESHUTDOWN || error == WSAEINTR))
-				fprintf(stderr, "recv: %d\n", error);
-#else
-			perror("read");
-#endif
-			pthread_exit(NULL);
-		}
-		else if(nbytes == 0) {
-			fputs("\rConnection lost.\n", stderr);
-			exit(1); // see what to do with this
+		if(nbytes < 1) {
+
+			if(program_closing) {
+				pthread_exit(NULL);
+			}
+
+			if(nbytes == -1) {
+
+	#ifdef _WIN32
+				int error = WSAGetLastError();
+			//	if(!(error == WSAESHUTDOWN || error == WSAEINTR))
+				fprintf(stderr, "\rrecv: %d\n", error);
+	#else
+				perror("\rrecv");
+	#endif
+				continue;
+			}
+			else if(nbytes == 0) {
+
+				fputs("\rConnection lost.\n", stderr);
+				exit(0);
+			}
 		}
 
 	//	printf("\033[3D%s\n-> ", buf); // Move left X column;
@@ -253,18 +266,25 @@ void socket_disconnected(int signal)
 	exit(1);
 }
 
-void close_program(void)
+void closing_procedure(void)
 {
 	putchar('\n');
 
+	program_closing = 1;
+
 #ifdef _WIN32
 	shutdown(sockfd, SD_BOTH);
+#else
+	shutdown(sockfd, SHUT_RDWR);
 #endif
+
 	closesocket(sockfd);
 	sockfd = INVALID_SOCKET;
+
 #ifdef _WIN32
 	WSACleanup();
 #endif
+
 	pthread_join(thread_id, NULL);
 }
 
@@ -272,7 +292,7 @@ __attribute__((__noreturn__))
 void exit_program(int signal)
 {
 	(void)signal;
-	exit(0); // calling exit(0) produces further call to close_program()
+	exit(0); // calling exit(0) produces further call to closing_procedure()
 }
 
 void print_help(void)
