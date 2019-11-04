@@ -1,12 +1,14 @@
 #ifdef _WIN32
  #include <winsock2.h>
  #include <ws2tcpip.h>
+ #include <windows.h>
 #else /* unix */
  #include <sys/socket.h>
  #include <netdb.h>
  #include <netinet/in.h>
  #include <arpa/inet.h>
 #endif
+
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
@@ -16,11 +18,12 @@
 #include <string.h>
 
 /* some win <-> unix translations/compatibility layer */
-#ifndef _WIN32 /* unix */
+#ifndef _WIN32 /* __unix__ */
  #define SOCKET int
  #define INVALID_SOCKET	-1
  #define SOCKET_ERROR   -1
  #define closesocket(sockfd) close(sockfd)
+ #define gai_strerrorA(errcode) gai_strerror(errcode)
 #endif
 
 
@@ -76,11 +79,40 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
+#ifdef _WIN32
+static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
+{
+	switch (fdwCtrlType)
+	{
+		// Handle the CTRL-C signal.
+	case CTRL_C_EVENT:
+		exit(0); // then exit() calls closing_procedure()
+
+		// CTRL-CLOSE: cmd windows closing
+	case CTRL_CLOSE_EVENT:
+		closing_procedure();
+		return TRUE;
+
+		// Pass other signals to the next handler.
+	case CTRL_BREAK_EVENT:
+		printf("\rCtrl-Break event\n\n");
+		sleep(1);
+		return FALSE;
+
+	case CTRL_LOGOFF_EVENT:
+	case CTRL_SHUTDOWN_EVENT:
+	default:
+		return FALSE;
+	}
+}
+#endif
+
 void set_signals(void)
 {
 #ifdef _WIN32
-	signal(SIGTERM, exit_program);
-	signal(SIGINT, exit_program);
+//	signal(SIGTERM, exit_program);
+//	signal(SIGINT, exit_program);
+	SetConsoleCtrlHandler(CtrlHandler, TRUE);
 #else
 	struct sigaction sa;
 	sigemptyset(&sa.sa_mask);
@@ -123,7 +155,7 @@ int open_socket(const char *address, const char *port)
 
 	errcode = getaddrinfo(address, port, &hints, &result);
 	if(errcode != 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(errcode));
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerrorA(errcode));
 		return errcode;
 	}
 
@@ -177,6 +209,7 @@ static void console(void)
 	size_t len;
 
 	fputs("-> ", stdout);
+	fflush(stdout);
 	while(strncmp(buf, "/quit", 6) != 0)
 	{
 		len = getLine(buf, sizeof buf);
@@ -237,6 +270,7 @@ static void *thread_listen(void *data)
 			else if(nbytes == 0) {
 
 				fputs("\rConnection lost.\n", stderr);
+				sleep(1);
 				exit(0);
 			}
 		}
@@ -263,6 +297,7 @@ void socket_disconnected(int signal)
 	(void)signal; // SIGPIPE
 
 	fputs("\nSocket disconnected\n", stderr);
+	sleep(1);
 	exit(1);
 }
 
