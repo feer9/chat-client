@@ -1,0 +1,23 @@
+1 VERSIONINFO
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904E4"
+    BEGIN
+      VALUE "CompanyName", "Feer Co."
+      VALUE "FileDescription", "My excellent chat client"
+      VALUE "FileVersion", "0.1"
+      VALUE "InternalName", "client"
+      VALUE "LegalCopyright", "Fernando Coda"
+      VALUE "OriginalFilename", "client.exe"
+      VALUE "ProductName", "Chat Client"
+      VALUE "ProductVersion", "0.1"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1252
+  END
+END
