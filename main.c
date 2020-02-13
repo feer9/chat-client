@@ -1,69 +1,37 @@
-#ifdef _WIN32
- #include <winsock2.h>
- #include <ws2tcpip.h>
- #include <windows.h>
-#else /* unix */
- #include <sys/socket.h>
- #include <netdb.h>
- #include <netinet/in.h>
- #include <arpa/inet.h>
-#endif
-
-#include <unistd.h>
-#include <signal.h>
-#include <pthread.h>
-#include <sys/types.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-/* some win <-> unix translations/compatibility layer */
-#ifndef _WIN32 /* __unix__ */
- #define SOCKET int
- #define INVALID_SOCKET	-1
- #define SOCKET_ERROR   -1
- #define closesocket(sockfd) close(sockfd)
- #define gai_strerrorA(errcode) gai_strerror(errcode)
-#endif
-
-
-#define PORT_DEFAULT_STR "27007"
-
-size_t getLine(char *buf, int buf_sz);
-void socket_disconnected(int signal);
-void closing_procedure(void);
-void exit_program(int signal);
-void print_help(void);
-void print_version(void);
-int open_socket(const char *address, const char *port);
-void set_signals(void);
-static pthread_t start_thread(void *(* func)(void *), void *data);
-static void console(void);
-static void *thread_listen(void *data);
-
+#include "client.h"
 
 static SOCKET sockfd = INVALID_SOCKET;
-static pthread_t thread_id = 0;
+static pthread_t threadlisten_id = 0;
 static int program_closing = 0;
+#ifdef _WIN32
+  static HANDLE hStdout = NULL, hStdin = NULL;
+#endif
 
-
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
 	char port[10] = PORT_DEFAULT_STR;
 
+#ifdef _WIN32
+	SetConsoleOutputCP(CP_UTF8);
+	SetConsoleCP(CP_UTF8);
+//	printf("locale: %s\n", setlocale(LC_ALL, ".utf8"));
 
-	if(argc < 2) {
+	hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+	hStdin  = GetStdHandle(STD_INPUT_HANDLE);
+#endif
+
+	if (argc < 2) {
 		printf("Usage: %s [host] [port]\n", argv[0]);
 		exit(1);
 	}
-	if(argc > 2) {
+	if (argc > 2) {
 		strncpy(port, argv[2], sizeof port - 1);
 	}
 
 	print_version();
 	printf("Attempting to connect to %s:%s\n", argv[1], port);
 
-	if(open_socket(argv[1], port) != 0) {
+	if (open_socket(argv[1], port) != 0) {
 		fprintf(stderr, "Closing client.\n");
 		exit(1);
 	}
@@ -72,7 +40,7 @@ int main(int argc, char *argv[])
 
 	puts("Type \"/quit\" or ^C to close this program.");
 
-	thread_id = start_thread(thread_listen, &sockfd);
+	threadlisten_id = start_thread(thread_listen, &sockfd);
 
 	console();
 
@@ -86,6 +54,8 @@ static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
 	{
 		// Handle the CTRL-C signal.
 	case CTRL_C_EVENT:
+	case CTRL_LOGOFF_EVENT:
+	case CTRL_SHUTDOWN_EVENT:
 		exit(0); // then exit() calls closing_procedure()
 
 		// CTRL-CLOSE: cmd windows closing
@@ -99,8 +69,6 @@ static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
 		sleep(1);
 		return FALSE;
 
-	case CTRL_LOGOFF_EVENT:
-	case CTRL_SHUTDOWN_EVENT:
 	default:
 		return FALSE;
 	}
@@ -110,8 +78,6 @@ static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
 void set_signals(void)
 {
 #ifdef _WIN32
-//	signal(SIGTERM, exit_program);
-//	signal(SIGINT, exit_program);
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);
 #else
 	struct sigaction sa;
@@ -144,7 +110,7 @@ int open_socket(const char *address, const char *port)
 	// Initialize Winsock
 	errcode = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (errcode != 0) {
-		wprintf(L"WSAStartup failed: %d\n", errcode);
+		printf("WSAStartup failed: %d\n", errcode);
 		return errcode;
 	}
 #endif
@@ -154,24 +120,24 @@ int open_socket(const char *address, const char *port)
 	hints.ai_socktype = SOCK_STREAM;
 
 	errcode = getaddrinfo(address, port, &hints, &result);
-	if(errcode != 0) {
+	if (errcode != 0) {
 		fprintf(stderr, "getaddrinfo: %s\n", gai_strerrorA(errcode));
 		return errcode;
 	}
 
-	for(rp = result; rp != NULL; rp = rp->ai_next)
+	for (rp = result; rp != NULL; rp = rp->ai_next)
 	{
 		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-		if(fd == INVALID_SOCKET)
+		if (fd == INVALID_SOCKET)
 			continue;
-		
-		if((errcode = connect(fd, rp->ai_addr, (int) rp->ai_addrlen)) != SOCKET_ERROR)
+
+		if ((errcode = connect(fd, rp->ai_addr, (int)rp->ai_addrlen)) != SOCKET_ERROR)
 			break;  /* success */
 
 		closesocket(fd);
 	}
 
-	if(rp == NULL) {  // couldn't find address
+	if (rp == NULL) {  // couldn't find address
 		fprintf(stderr, "Could not connect.\n");
 		return 1;
 	}
@@ -185,42 +151,27 @@ int open_socket(const char *address, const char *port)
 	return errcode;
 }
 
-static pthread_t start_thread(void *(* func)(void *), void *data)
-{
-	pthread_t id;
-//	pthread_attr_t thread_attr;
-
-//	pthread_attr_init(&thread_attr);
-//	pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED);
-
-//	pthread_create(&id, &thread_attr, thread_listen, data);
-	pthread_create(&id, NULL, func, data);
-//  pthread_detach(id);
-
-//	pthread_attr_destroy(&thread_attr);
-
-	return id;
-}
-
 static void console(void)
 {
-	char buf[128];
+	char buf[192] = { 0 };
 	ssize_t nbytes;
-	size_t len;
+	TXRX_SZ len;
 
 	fputs("-> ", stdout);
 	fflush(stdout);
-	while(strncmp(buf, "/quit", 6) != 0)
-	{
-		len = getLine(buf, sizeof buf);
-		if(buf[0] == '/')
-		{
-			char *cmd = &buf[1];
 
-			if(strncmp(cmd, "help",  5) == 0)
+	while (strncmp(buf, "/quit", 6) != 0)
+	{
+		len = (TXRX_SZ) getLine(buf, sizeof buf);
+
+		if (buf[0] == '/')
+		{
+			char* cmd = &buf[1];
+
+			if (strncmp(cmd, "help", 5) == 0)
 				print_help();
 
-			else if(strncmp(cmd, "quit",  5) == 0)
+			else if (strncmp(cmd, "quit", 5) == 0)
 				break;
 
 			else
@@ -229,45 +180,68 @@ static void console(void)
 		}
 		else
 		{
-			nbytes = send(sockfd, buf, len+1, 0);
-			if(nbytes == -1) {
+			nbytes = send(sockfd, buf, len + 1, 0);
+			if (nbytes == -1) {
 				perror("write");
 				exit(1);
 			}
 		}
 		fputs("-> ", stdout);
+		fflush(stdout);
 	}
 }
 
-static void *thread_listen(void *data)
+static pthread_t start_thread(THREAD_RET_T(*func)(void*), void* data)
 {
-//	SOCKET sockfd = *(SOCKET*)data;
+#ifdef _WIN32
+	_configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+
+	return (HANDLE) _beginthreadex(NULL, 0, func, data, 0, NULL);
+#else
+	pthread_t id;
+	//	pthread_attr_t thread_attr;
+
+	//	pthread_attr_init(&thread_attr);
+	//	pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED);
+
+	//	pthread_create(&id, &thread_attr, thread_listen, data);
+	pthread_create(&id, NULL, func, data);
+	//  pthread_detach(id);
+
+	//	pthread_attr_destroy(&thread_attr);
+
+	return id;
+#endif
+}
+
+static THREAD_RET_T STDCALL thread_listen(void* data)
+{
+	//	SOCKET sockfd = *(SOCKET*)data;
 	(void)data;
-	char buf[128];
-	const size_t buffsize = sizeof(buf);
+	char buf[256];
+	const TXRX_SZ buffsize = sizeof(buf);
 	ssize_t nbytes;
 
-	while(1)
+	while (1)
 	{
 		nbytes = recv(sockfd, buf, buffsize, 0);
-		if(nbytes < 1) {
+		if (nbytes < 1) {
 
-			if(program_closing) {
-				pthread_exit(NULL);
+			if (program_closing) {
+				break;
 			}
+			if (nbytes == -1) {
 
-			if(nbytes == -1) {
-
-	#ifdef _WIN32
+#ifdef _WIN32
 				int error = WSAGetLastError();
-			//	if(!(error == WSAESHUTDOWN || error == WSAEINTR))
-				fprintf(stderr, "\rrecv: %d\n", error);
-	#else
+				if(!(error == WSAESHUTDOWN || error == WSAEINTR))
+					fprintf(stderr, "\rrecv: %d\n", error);
+#else
 				perror("\rrecv");
-	#endif
+#endif
 				continue;
 			}
-			else if(nbytes == 0) {
+			else if (nbytes == 0) {
 
 				fputs("\rConnection lost.\n", stderr);
 				sleep(1);
@@ -275,24 +249,55 @@ static void *thread_listen(void *data)
 			}
 		}
 
-	//	printf("\033[3D%s\n-> ", buf); // Move left X column;
+		//	printf("\033[3D%s\n-> ", buf); // Move left X column;
 		printf("\r%s\n-> ", buf);
 		fflush(stdout);
 	}
+
+#ifdef _WIN32
+	_endthreadex(0);
+#else
+	pthread_exit(NULL);
+#endif
+	return 0; // remove some warning, get another, meh
 }
 
-size_t getLine(char *buf, int buf_sz)
+
+// returns the number of BYTES read
+size_t getLine(char* buf, int buf_sz)
 {
-	fgets(buf, buf_sz, stdin);
-	size_t len = strlen(buf);
-	if(len>0)
-		buf[--len] = '\0';
+	size_t size_rd = 0;
+#ifdef _WIN32
+	static wchar_t wstr[128] = { 0 };
+	unsigned long len;
+	int ret;
 
-	return len;
+	ReadConsoleW(hStdin, wstr, 128, &len, NULL);
+	ret = WideCharToMultiByte(CP_UTF8, 0, wstr, (int)len, buf, buf_sz, NULL, NULL);
+	if(ret > 0)
+	{
+		size_rd = (size_t) ret;
+		if (size_rd > 1) {
+			size_rd -= 2;
+			buf[size_rd] = '\0';
+		}
+	}
+	else {
+		buf[0] = '\0';
+	}
+#else
+
+	fgets(buf, buf_sz, stdin);
+	size_rd = strlen(buf);
+	if (size_rd > 0)
+		buf[--size_rd] = '\0';
+
+#endif
+
+	return size_rd;
 }
 
-__attribute__((__noreturn__))
-void socket_disconnected(int signal)
+NORETURN void socket_disconnected(int signal)
 {
 	(void)signal; // SIGPIPE
 
@@ -318,13 +323,12 @@ void closing_procedure(void)
 
 #ifdef _WIN32
 	WSACleanup();
+#else
+	pthread_join(threadlisten_id, NULL);
 #endif
-
-	pthread_join(thread_id, NULL);
 }
 
-__attribute__((__noreturn__))
-void exit_program(int signal)
+NORETURN void exit_program(int signal)
 {
 	(void)signal;
 	exit(0); // calling exit(0) produces further call to closing_procedure()
@@ -345,3 +349,7 @@ void print_version(void)
 {
 	puts("Chat client v0.1");
 }
+
+/*
+https://stackoverflow.com/questions/421860/capture-characters-from-standard-input-without-waiting-for-enter-to-be-pressed
+*/
