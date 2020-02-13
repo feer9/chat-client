@@ -194,7 +194,7 @@ static void console(void)
 static pthread_t start_thread(THREAD_RET_T(*func)(void*), void* data)
 {
 #ifdef _WIN32
-	_configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+//	_configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
 
 	return (HANDLE) _beginthreadex(NULL, 0, func, data, 0, NULL);
 #else
