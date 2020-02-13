@@ -323,6 +323,8 @@ void closing_procedure(void)
 
 #ifdef _WIN32
 	WSACleanup();
+	WaitForSingleObject( threadlisten_id, 500 );
+	CloseHandle( threadlisten_id );
 #else
 	pthread_join(threadlisten_id, NULL);
 #endif
