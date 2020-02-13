@@ -6,6 +6,9 @@ CONFIG -= qt
 SOURCES += \
         main.c
 
+HEADERS += \
+        client.h
+
 
 win32:CONFIG += static
 win32-msvc:QMAKE_CFLAGS += /utf-8
