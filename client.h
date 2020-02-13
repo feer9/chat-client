@@ -35,7 +35,7 @@
   #define SOCKET int
   #define INVALID_SOCKET	-1
   #define SOCKET_ERROR   -1
-  #define THREAD_RET_T (void*)
+  #define THREAD_RET_T void*
   #define closesocket(sockfd) close(sockfd)
   #define gai_strerrorA(errcode) gai_strerror(errcode)
   #define STDCALL
