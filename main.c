@@ -287,10 +287,13 @@ size_t getLine(char* buf, int buf_sz)
 	}
 #else
 
-	fgets(buf, buf_sz, stdin);
+	if(fgets(buf, buf_sz, stdin) == NULL) {
+		exit(0);
+	}
 	size_rd = strlen(buf);
-	if (size_rd > 0)
+	if (size_rd > 0) {
 		buf[--size_rd] = '\0';
+	}
 
 #endif
 
