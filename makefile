@@ -1,3 +1,6 @@
+CFLAGS  = -Wall -no-pie `pkg-config --cflags openssl`
+LDFLAGS = -lpthread `pkg-config --libs openssl`
+
 # If the first argument is "run"...
 ifeq (run,$(firstword $(MAKECMDGOALS)))
   # use the rest as arguments for "run"
@@ -13,8 +16,8 @@ all: build
 build: client
 
 
-client: main.c #client.h 
-	gcc -Wall -no-pie main.c -o client -lpthread
+client: main.c client.h 
+	gcc $(CFLAGS) main.c -o client $(LDFLAGS)
 
 .PHONY: run
 run: client
@@ -22,3 +25,4 @@ run: client
 
 clean:
 	rm -rf client
+

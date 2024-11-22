@@ -1,8 +1,9 @@
 #include "client.h"
 
 static SOCKET sockfd = INVALID_SOCKET;
-static pthread_t threadlisten_id = 0;
-static int program_closing = 0;
+static pthread_t threadlisten_tid = 0;
+static pthread_t threadmain_tid = 0;
+static atomic_int program_closing = 0;
 #ifdef _WIN32
   static HANDLE hStdout = NULL, hStdin = NULL;
 #endif
@@ -40,7 +41,8 @@ int main(int argc, char* argv[])
 
 	puts("Type \"/quit\" or ^C to close this program.");
 
-	threadlisten_id = start_thread(thread_listen, &sockfd);
+	threadmain_tid = pthread_self();
+	threadlisten_tid = start_thread(thread_listen, &sockfd);
 
 	console();
 
@@ -75,27 +77,66 @@ static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
 }
 #endif
 
+#ifndef _WIN32
+static void set_signal_handler(int signum, struct sigaction *sa)
+{
+	if (sigaction(signum, sa, NULL) == -1) {
+		perror("sigaction");
+		exit(1);
+	}
+}
+#endif
+
 void set_signals(void)
 {
 #ifdef _WIN32
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);
 #else
-	struct sigaction sa;
+	struct sigaction sa = {0};
 	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESTART;
+
+	sa.sa_flags = 0;
+//	sa.sa_flags |= SA_RESTART;
+	/* Este flag hace que cuando se recibe una interrupción     */
+	/* la syscall no retorne error, sino q vuelva a ejecutarse. */
+
 	sa.sa_handler = exit_program;
-	if (sigaction(SIGTERM, &sa, NULL) == -1 ||
-		sigaction(SIGINT,  &sa, NULL) == -1) {
-		perror("sigaction");
-		exit(1);
-	}
+	set_signal_handler(SIGTERM, &sa);
+	set_signal_handler(SIGINT,  &sa);
+
 	sa.sa_handler = socket_disconnected;
-	if (sigaction(SIGPIPE, &sa, NULL) == -1) {
-		perror("sigaction");
-		exit(1);
-	}
+	set_signal_handler(SIGPIPE,  &sa);
+
+	sa.sa_handler = SIG_IGN;
+	set_signal_handler(SIGUSR1,  &sa);
+	set_signal_handler(SIGUSR2,  &sa);
 #endif
 	atexit(closing_procedure);
+}
+
+void cosas_ssl(void)
+{
+	SSL_library_init();
+	SSL_load_error_strings();
+	const SSL_METHOD *method = SSLv23_client_method();
+	SSL_CTX *ctx = SSL_CTX_new(method);
+	SSL *ssl = SSL_new(ctx);
+	SSL_set_fd(ssl, sockfd);
+	if (SSL_connect(ssl) <= 0)
+	{
+		ERR_print_errors_fp(stderr);
+	}
+	else
+	{
+		printf("Connected to server via SSL.\n");
+		SSL_write(ssl, "Hello, server!", strlen("Hello, server!"));
+		char buffer[256] = {0};
+		SSL_read(ssl, buffer, sizeof(buffer));
+		printf("Received: %s\n", buffer);
+	}
+	SSL_shutdown(ssl);
+	SSL_free(ssl);
+	SSL_CTX_free(ctx);
 }
 
 int open_socket(const char *address, const char *port)
@@ -144,7 +185,8 @@ int open_socket(const char *address, const char *port)
 
 	sockfd = fd; // set file descriptor as global
 
-	printf("Connected to %s (%s)\n", address, inet_ntoa(((struct sockaddr_in*)rp->ai_addr)->sin_addr));
+	printf("Connected to %s (%s)\n", address, 
+	       inet_ntoa(((struct sockaddr_in*)rp->ai_addr)->sin_addr));
 
 	freeaddrinfo(result);
 
@@ -174,21 +216,77 @@ static void console(void)
 			else if (strncmp(cmd, "quit", 5) == 0)
 				break;
 
+			else if (strncmp(cmd, "users", 6) == 0)
+				print_help(); // TODO: implement
+
 			else
 				fputs("Unknown command. Type \"/help\" for more info.\n", stdout);
 
 		}
-		else
+		else if (len > 0)
 		{
 			nbytes = send(sockfd, buf, len + 1, 0);
 			if (nbytes == -1) {
-				perror("write");
+				perror("send");
 				exit(1);
 			}
 		}
-		fputs("-> ", stdout);
+		else {
+			printf("\033[A\033[D"); /* move cursor up & scroll up one line */
+		}
+		
+		fputs("\r-> \033[K", stdout);
 		fflush(stdout);
 	}
+}
+
+// returns the number of BYTES read
+size_t getLine(char* buf, int buf_sz)
+{
+	size_t size_rd = 0;
+	buf[0] = '\0';
+#ifdef _WIN32
+	static wchar_t wstr[128] = { 0 };
+	unsigned long len;
+	int ret;
+
+	ReadConsoleW(hStdin, wstr, 128, &len, NULL);
+	ret = WideCharToMultiByte(CP_UTF8, 0, wstr, (int)len, buf, buf_sz, NULL, NULL);
+	if(ret > 0)
+	{
+		size_rd = (size_t) ret;
+		if (size_rd > 1) {
+			size_rd -= 2;
+			buf[size_rd] = '\0';
+		}
+	}
+	else {
+		buf[0] = '\0'; // redundante?
+	}
+
+#else
+	char *ret;
+	do {
+		ret = fgets(buf, buf_sz, stdin);
+		if(ret == NULL) {
+			if(errno == 0 || (errno == EINTR && program_closing)) {
+				exit(0);
+			}
+			if(errno != EINTR) {
+				perror("fgets");
+				exit(1);
+			}
+		}
+	}
+	while(ret == NULL);
+
+	size_rd = strnlen(buf, buf_sz);
+	if (size_rd > 0) {
+		buf[--size_rd] = '\0'; // clear new line char
+	}
+#endif
+
+	return size_rd;
 }
 
 static pthread_t start_thread(THREAD_RET_T(*func)(void*), void* data)
@@ -216,7 +314,6 @@ static pthread_t start_thread(THREAD_RET_T(*func)(void*), void* data)
 
 static THREAD_RET_T STDCALL thread_listen(void* data)
 {
-	//	SOCKET sockfd = *(SOCKET*)data;
 	(void)data;
 	char buf[256];
 	const TXRX_SZ buffsize = sizeof(buf);
@@ -225,31 +322,27 @@ static THREAD_RET_T STDCALL thread_listen(void* data)
 	while (1)
 	{
 		nbytes = recv(sockfd, buf, buffsize, 0);
+		if (program_closing) {
+			break;
+		}
 		if (nbytes < 1) {
 
-			if (program_closing) {
-				break;
-			}
 			if (nbytes == -1) {
-
-#ifdef _WIN32
+			#ifdef _WIN32
 				int error = WSAGetLastError();
 				if(!(error == WSAESHUTDOWN || error == WSAEINTR))
 					fprintf(stderr, "\rrecv: %d\n", error);
-#else
+			#else
 				perror("\rrecv");
-#endif
+			#endif
 				continue;
 			}
 			else if (nbytes == 0) {
-
 				fputs("\rConnection lost.\n", stderr);
-				sleep(1);
-				exit(0);
+				threadlisten_exit(0,NULL);
 			}
 		}
 
-		//	printf("\033[3D%s\n-> ", buf); // Move left X column;
 		printf("\r%s\n-> ", buf);
 		fflush(stdout);
 	}
@@ -259,45 +352,42 @@ static THREAD_RET_T STDCALL thread_listen(void* data)
 #else
 	pthread_exit(NULL);
 #endif
-	return 0; // remove some warning, get another, meh
+	return 0; // remove some warning, get another... meh
 }
 
 
-// returns the number of BYTES read
-size_t getLine(char* buf, int buf_sz)
+void closing_procedure(void)
 {
-	size_t size_rd = 0;
-#ifdef _WIN32
-	static wchar_t wstr[128] = { 0 };
-	unsigned long len;
-	int ret;
+	putchar('\n');
+	pthread_t self_tid = pthread_self();
+	dbg_print("in closing_procedure() from %s thread.\n", 
+	          self_tid == threadmain_tid ? "main":"listen");
+	
+	program_closing = 1;
 
-	ReadConsoleW(hStdin, wstr, 128, &len, NULL);
-	ret = WideCharToMultiByte(CP_UTF8, 0, wstr, (int)len, buf, buf_sz, NULL, NULL);
-	if(ret > 0)
+	if(sockfd != INVALID_SOCKET)
 	{
-		size_rd = (size_t) ret;
-		if (size_rd > 1) {
-			size_rd -= 2;
-			buf[size_rd] = '\0';
-		}
-	}
-	else {
-		buf[0] = '\0';
-	}
-#else
+	#ifdef _WIN32
+		shutdown(sockfd, SD_BOTH);
+	#else
+		shutdown(sockfd, SHUT_RDWR);
+	#endif
 
-	if(fgets(buf, buf_sz, stdin) == NULL) {
-		exit(0);
-	}
-	size_rd = strlen(buf);
-	if (size_rd > 0) {
-		buf[--size_rd] = '\0';
+		closesocket(sockfd);
+		sockfd = INVALID_SOCKET;
 	}
 
-#endif
-
-	return size_rd;
+	if(threadlisten_tid != 0 && self_tid != threadlisten_tid)
+	{
+	#ifdef _WIN32
+		WSACleanup();
+		WaitForSingleObject( threadlisten_tid, 500 );
+		CloseHandle( threadlisten_tid );
+	#else
+		pthread_join(threadlisten_tid, NULL);
+	#endif
+		threadlisten_tid = 0;
+	}
 }
 
 NORETURN void socket_disconnected(int signal)
@@ -309,34 +399,20 @@ NORETURN void socket_disconnected(int signal)
 	exit(1);
 }
 
-void closing_procedure(void)
-{
-	putchar('\n');
-
-	program_closing = 1;
-
-#ifdef _WIN32
-	shutdown(sockfd, SD_BOTH);
-#else
-	shutdown(sockfd, SHUT_RDWR);
-#endif
-
-	closesocket(sockfd);
-	sockfd = INVALID_SOCKET;
-
-#ifdef _WIN32
-	WSACleanup();
-	WaitForSingleObject( threadlisten_id, 500 );
-	CloseHandle( threadlisten_id );
-#else
-	pthread_join(threadlisten_id, NULL);
-#endif
-}
-
 NORETURN void exit_program(int signal)
 {
 	(void)signal;
 	exit(0); // calling exit(0) produces further call to closing_procedure()
+}
+
+NORETURN static void threadlisten_exit(int status, const char *msg)
+{
+	program_closing = 1;
+	dbg_print("in threadlisten_exit()\n");
+	if(msg)
+		perror(msg);
+	pthread_kill(threadmain_tid, SIGTERM);
+	pthread_exit(NULL);
 }
 
 void print_help(void)
@@ -344,9 +420,10 @@ void print_help(void)
 	print_version();
 	puts("All commands start with a forward slash \"/\"");
 	puts("");
-	puts("Known commands:");
-	puts("/help\tDisplay this message.");
-	puts("/quit\tDisconnect from the server and exit.");
+	puts("Available commands:");
+	puts("\t/help\tDisplay this message.");
+	puts("\t/users\tShow info about connected users.");
+	puts("\t/quit\tDisconnect from the server and exit.");
 	puts("");
 }
 
