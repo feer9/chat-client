@@ -7,6 +7,7 @@
   #include <process.h>
   #include <Windows.h>
 #else /* unix */
+  #define _XOPEN_SOURCE 700
   #include <unistd.h>
   #include <pthread.h>
   #include <sys/socket.h>
@@ -22,6 +23,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 //#include <locale.h>
 #include <openssl/ssl.h>
@@ -45,7 +47,7 @@
   #define STDCALL
   #define TXRX_SZ size_t
 #else /* windows */
-  #define sleep(s) Sleep(s*1000)
+  #define sleep_ms(ms) Sleep(ms)
   #define pthread_t HANDLE
   #define STDCALL __stdcall
   #define THREAD_RET_T unsigned
@@ -55,6 +57,7 @@
   #else
 	#define ssize_t long
   #endif
+  #define SHUT_RDWR SD_BOTH /* shutdown() flag */
 #endif
 
 #define PORT_DEFAULT_STR "27007"
@@ -69,14 +72,17 @@ size_t getLine(char* buf, int buf_sz);
 NORETURN void socket_disconnected(int signal);
 void closing_procedure(void);
 NORETURN void exit_program(int signal);
-void wakeup(int signal);
 void print_help(void);
 void print_version(void);
 int open_socket(const char* address, const char* port);
-void set_signals(void);
+void set_mainthread_signals(void);
+void set_listenthread_signals(void);
 static void console(void);
 static pthread_t start_thread(THREAD_RET_T (* func)(void *), void *data);
 static THREAD_RET_T STDCALL thread_listen(void* data);
 NORETURN static void threadlisten_exit(int status, const char *msg);
+void sleep_ms(int ms);
+void connect_SSL(void);
+void init_SSL(void);
 
 #endif // _CLIENT_H

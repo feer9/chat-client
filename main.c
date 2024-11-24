@@ -3,7 +3,9 @@
 static SOCKET sockfd = INVALID_SOCKET;
 static pthread_t threadlisten_tid = 0;
 static pthread_t threadmain_tid = 0;
-static atomic_int program_closing = 0;
+static atomic_bool program_closing = false;
+static SSL *ssl = NULL;
+static SSL_CTX *ctx = NULL;
 #ifdef _WIN32
   static HANDLE hStdout = NULL, hStdin = NULL;
 #endif
@@ -30,14 +32,18 @@ int main(int argc, char* argv[])
 	}
 
 	print_version();
+	dbg_print("PID: %d\n", getpid());
 	printf("Attempting to connect to %s:%s\n", argv[1], port);
 
+	init_SSL();
 	if (open_socket(argv[1], port) != 0) {
 		fprintf(stderr, "Closing client.\n");
 		exit(1);
 	}
+	connect_SSL();
+	// TODO: normalizar el manejo de errores. Cerrar adecuadamente en cada caso.
 
-	set_signals();
+	set_mainthread_signals();
 
 	puts("Type \"/quit\" or ^C to close this program.");
 
@@ -68,7 +74,7 @@ static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
 		// Pass other signals to the next handler.
 	case CTRL_BREAK_EVENT:
 		printf("\rCtrl-Break event\n\n");
-		sleep(1);
+		sleep_ms(500);
 		return FALSE;
 
 	default:
@@ -87,7 +93,7 @@ static void set_signal_handler(int signum, struct sigaction *sa)
 }
 #endif
 
-void set_signals(void)
+void set_mainthread_signals(void)
 {
 #ifdef _WIN32
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);
@@ -107,36 +113,69 @@ void set_signals(void)
 	sa.sa_handler = socket_disconnected;
 	set_signal_handler(SIGPIPE,  &sa);
 
-	sa.sa_handler = SIG_IGN;
-	set_signal_handler(SIGUSR1,  &sa);
-	set_signal_handler(SIGUSR2,  &sa);
+	sigaddset(&sa.sa_mask, SIGUSR1);
+	sigaddset(&sa.sa_mask, SIGUSR2);
+	if(pthread_sigmask(SIG_BLOCK, &sa.sa_mask, NULL) != 0) {
+		perror("pthread_sigmask");
+		exit(1);
+	}
+
 #endif
 	atexit(closing_procedure);
 }
 
-void cosas_ssl(void)
+void set_listenthread_signals(void)
 {
-	SSL_library_init();
-	SSL_load_error_strings();
-	const SSL_METHOD *method = SSLv23_client_method();
-	SSL_CTX *ctx = SSL_CTX_new(method);
-	SSL *ssl = SSL_new(ctx);
-	SSL_set_fd(ssl, sockfd);
+#ifdef _WIN32
+	// ???
+#else
+	// Block all signals from listen thread, receive everything from main thread
+	sigset_t sigset;
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGTERM);
+	sigaddset(&sigset, SIGINT);
+	sigaddset(&sigset, SIGPIPE);
+	sigaddset(&sigset, SIGUSR1);
+	sigaddset(&sigset, SIGUSR2);
+
+	if(pthread_sigmask(SIG_BLOCK, &sigset, NULL) != 0) {
+		perror("pthread_sigmask");
+		exit(1);
+	}
+#endif
+}
+
+void connect_SSL(void)
+{
+	ssl = SSL_new(ctx);
+	if(ssl == NULL)
+		exit(EXIT_FAILURE);
+
+	if(SSL_set_fd(ssl, sockfd) != 1)
+		exit(EXIT_FAILURE);
+
 	if (SSL_connect(ssl) <= 0)
 	{
 		ERR_print_errors_fp(stderr);
+		exit(1);
 	}
 	else
 	{
 		printf("Connected to server via SSL.\n");
-		SSL_write(ssl, "Hello, server!", strlen("Hello, server!"));
-		char buffer[256] = {0};
-		SSL_read(ssl, buffer, sizeof(buffer));
-		printf("Received: %s\n", buffer);
+		/* For the transparent negotiation to succeed, the ssl must have been 
+		initialized to client or server mode. This is being done by calling 
+		SSL_set_connect_state(3) or SSL_set_accept_state() before the first 
+		call to a write function.*/
 	}
-	SSL_shutdown(ssl);
-	SSL_free(ssl);
-	SSL_CTX_free(ctx);
+}
+
+void init_SSL(void)
+{
+	SSL_library_init();
+	SSL_load_error_strings();
+
+	const SSL_METHOD *method = SSLv23_client_method();
+	ctx = SSL_CTX_new(method);
 }
 
 int open_socket(const char *address, const char *port)
@@ -225,8 +264,10 @@ static void console(void)
 		}
 		else if (len > 0)
 		{
-			nbytes = send(sockfd, buf, len + 1, 0);
-			if (nbytes == -1) {
+		//	nbytes = send(sockfd, buf, len + 1, 0);
+			nbytes = SSL_write(ssl, buf, len+1);
+			if (nbytes < 1) {
+				// See SSL_get_error()
 				perror("send");
 				exit(1);
 			}
@@ -269,7 +310,7 @@ size_t getLine(char* buf, int buf_sz)
 	do {
 		ret = fgets(buf, buf_sz, stdin);
 		if(ret == NULL) {
-			if(errno == 0 || (errno == EINTR && program_closing)) {
+			if(errno == 0 || (errno == EINTR && atomic_load(&program_closing))) {
 				exit(0);
 			}
 			if(errno != EINTR) {
@@ -297,17 +338,10 @@ static pthread_t start_thread(THREAD_RET_T(*func)(void*), void* data)
 	return (HANDLE) _beginthreadex(NULL, 0, func, data, 0, NULL);
 #else
 	pthread_t id;
-	//	pthread_attr_t thread_attr;
-
-	//	pthread_attr_init(&thread_attr);
-	//	pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED);
-
-	//	pthread_create(&id, &thread_attr, thread_listen, data);
-	pthread_create(&id, NULL, func, data);
-	//  pthread_detach(id);
-
-	//	pthread_attr_destroy(&thread_attr);
-
+	if(pthread_create(&id, NULL, func, data) != 0) {
+		perror("pthread_create");
+		exit(1);
+	}
 	return id;
 #endif
 }
@@ -319,15 +353,32 @@ static THREAD_RET_T STDCALL thread_listen(void* data)
 	const TXRX_SZ buffsize = sizeof(buf);
 	ssize_t nbytes;
 
+	set_listenthread_signals();
+
 	while (1)
 	{
-		nbytes = recv(sockfd, buf, buffsize, 0);
-		if (program_closing) {
+	//	nbytes = recv(sockfd, buf, buffsize, 0);
+		nbytes = SSL_read(ssl, buf, buffsize);
+		if (atomic_load(&program_closing)) {
 			break;
 		}
 		if (nbytes < 1) {
+			int error = SSL_get_error(ssl, nbytes);
 
-			if (nbytes == -1) {
+			if (error == SSL_ERROR_ZERO_RETURN) {
+                fputs("\rConnection closed by host.\n", stderr);
+				threadlisten_exit(0,NULL);
+                break;
+            } else if (error == SSL_ERROR_SYSCALL) {
+                dbg_print("SSL_read interrupted by signal.\n");
+                break;
+            } else {
+                ERR_print_errors_fp(stderr);
+				threadlisten_exit(0,NULL);
+                break;
+            }
+			/* TODO: test errors in Windows */
+		/*	if (nbytes == -1) {
 			#ifdef _WIN32
 				int error = WSAGetLastError();
 				if(!(error == WSAESHUTDOWN || error == WSAEINTR))
@@ -336,11 +387,7 @@ static THREAD_RET_T STDCALL thread_listen(void* data)
 				perror("\rrecv");
 			#endif
 				continue;
-			}
-			else if (nbytes == 0) {
-				fputs("\rConnection lost.\n", stderr);
-				threadlisten_exit(0,NULL);
-			}
+			} */
 		}
 
 		printf("\r%s\n-> ", buf);
@@ -358,27 +405,60 @@ static THREAD_RET_T STDCALL thread_listen(void* data)
 
 void closing_procedure(void)
 {
-	putchar('\n');
-	pthread_t self_tid = pthread_self();
-	dbg_print("in closing_procedure() from %s thread.\n", 
-	          self_tid == threadmain_tid ? "main":"listen");
-	
-	program_closing = 1;
+	write(STDOUT_FILENO, "\n", 1);
+	pthread_t self_tid = pthread_self();	
+	atomic_store(&program_closing, true);
+
+	// TODO: can't call printf() after exit() safely. Replace with write()
+
+	if(ssl)
+	{
+		dbg_print("Closing SSL... ");
+
+		/* To finish the connection properly, we send a "close notify" alert to
+		the server. In most cases, we have to wait for the same message from the
+		server, and perform the call again. */
+		int ret = SSL_shutdown(ssl);
+		if (ret < 0) {
+			ERR_print_errors_fp(stderr);
+			_exit(EXIT_FAILURE);
+		}
+		else if (ret == 0) {
+			sleep_ms(100);
+			if (SSL_shutdown(ssl) != 1) {
+				dbg_print("[ NOK ]\n");
+			}
+			else {
+				dbg_print("[ OK ]\n");
+			}
+		}else {
+			dbg_print("[ OK ]\n");
+		}
+
+		SSL_free(ssl);
+		ssl = NULL;
+	}
+
+	if(ctx)
+	{
+		dbg_print("Closing SSL Context... ");
+		SSL_CTX_free(ctx);
+		ctx = NULL;
+		dbg_print("[ OK ]\n");
+	}
 
 	if(sockfd != INVALID_SOCKET)
 	{
-	#ifdef _WIN32
-		shutdown(sockfd, SD_BOTH);
-	#else
+		dbg_print("Closing socket... ");
 		shutdown(sockfd, SHUT_RDWR);
-	#endif
-
 		closesocket(sockfd);
 		sockfd = INVALID_SOCKET;
+		dbg_print("[ OK ]\n");
 	}
 
 	if(threadlisten_tid != 0 && self_tid != threadlisten_tid)
 	{
+		dbg_print("Joining listen thread... ");
 	#ifdef _WIN32
 		WSACleanup();
 		WaitForSingleObject( threadlisten_tid, 500 );
@@ -387,6 +467,7 @@ void closing_procedure(void)
 		pthread_join(threadlisten_tid, NULL);
 	#endif
 		threadlisten_tid = 0;
+		dbg_print("[ OK ]\n");
 	}
 }
 
@@ -395,7 +476,7 @@ NORETURN void socket_disconnected(int signal)
 	(void)signal; // SIGPIPE
 
 	fputs("\nSocket disconnected\n", stderr);
-	sleep(1);
+	sleep_ms(500);
 	exit(1);
 }
 
@@ -407,13 +488,30 @@ NORETURN void exit_program(int signal)
 
 NORETURN static void threadlisten_exit(int status, const char *msg)
 {
-	program_closing = 1;
-	dbg_print("in threadlisten_exit()\n");
+	atomic_store(&program_closing, true);
 	if(msg)
 		perror(msg);
 	pthread_kill(threadmain_tid, SIGTERM);
 	pthread_exit(NULL);
 }
+
+#ifndef _WIN32
+void sleep_ms(int ms)
+{
+	struct timespec tim, rem;
+	tim.tv_sec = ms / 1000;
+	tim.tv_nsec = (ms % 1000) * 1E6;
+
+	if(nanosleep(&tim , &rem) == -1)
+	{
+		if (errno == EINTR)
+			sleep_ms(rem.tv_sec*1000 + rem.tv_nsec/1E6);
+		
+		else
+			perror("nanosleep");
+	}
+}
+#endif
 
 void print_help(void)
 {
